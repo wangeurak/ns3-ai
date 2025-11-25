@@ -24,16 +24,15 @@
 
 struct Env
 {
-    uint32_t txNode;
-    std::array<double, 5> rxPower;
-    uint32_t mcs;
-    double holDelay;
-    double throughput;
+    uint32_t nodeId;
+    double x;
+    double y;
+    double sinr;
 };
 
 struct Act
 {
-    double newCcaSensitivity;
+    double txPower;
 };
 
 #endif // NS3_MULTI_BSS_H

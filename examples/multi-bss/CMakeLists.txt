@@ -21,7 +21,10 @@ build_lib_example(
             ${libantenna}
             ${libbuildings}
             ${libmobility}
-            ${gsl_libraries}
+            ${libolsr}
+            ${libaodv}
+            ${libflow-monitor}
+            ${GSL_LIBRARIES}
 )
 
 pybind11_add_module(ns3ai_multibss_py multi_bss_py.cc)

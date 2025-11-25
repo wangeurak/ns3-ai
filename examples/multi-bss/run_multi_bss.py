@@ -58,26 +58,14 @@ class DQN(nn.Module):
 
 
 ns3Settings = {
-    'pktSize': 1500,
-    'duration': 100,
-    'gi': 800,
-    'channelWidth': 20,
-    'rng': 2,
-    'apNodes': 4,
-    'networkSize': 4,
-    'ring': 0,
-    'maxMpdus': 5,
-    'autoMCS': True,
-    'prop': 'tgax',
-    'app': 'setup-done',
-    'pktInterval': 5000,
-    'boxsize': 25,
-    'drl': True,
-    'configFile': 'contrib/ai/examples/multi-bss/config.txt',
+    'packetSize': 1000,
+    'simulationTime': 100,
+    'step': 10,
+    'seed': 1,
 }
-n_ap = int(ns3Settings['apNodes'])
-n_sta = int(ns3Settings['networkSize'])
-n_total = n_ap * (n_sta + 1)
+n_total = 4
+n_sta = 4
+n_ap = 1
 state = np.zeros((n_sta+1, n_total+1))
 rewards = []
 overall_rewards = []
@@ -217,17 +205,18 @@ try:
             print("Finished")
             break
         throughput = 0
+        vrDelay = 0
+        vrThroughput = 0
         for i in range(n_total):
             txNode = msgInterface.GetCpp2PyVector()[i].txNode
             # print("processing i {} txNode {}".format(i, txNode))
-            for j in range(n_sta+1):
+            for j in range(min(5, n_sta+1)):
                 state[j, txNode] = msgInterface.GetCpp2PyVector()[i].rxPower[j]
-            # state[:, txNode] = msgInterface.GetCpp2PyVector()[i].rxPower
-            if txNode % n_ap == 0:  # record mcs in BSS-0
-                state[int(txNode/n_ap)][-1] = msgInterface.GetCpp2PyVector()[i].mcs
-            if txNode == n_ap:     # record delay and tpt of the VR node
+            
+            if i == 0:
                 vrDelay = msgInterface.GetCpp2PyVector()[i].holDelay
                 vrThroughput = msgInterface.GetCpp2PyVector()[i].throughput
+            
             # Sum all nodes' throughput
             throughput += msgInterface.GetCpp2PyVector()[i].throughput
         msgInterface.PyRecvEnd()
