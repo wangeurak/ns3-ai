@@ -6,17 +6,18 @@
 // 定义 C++ 发送给 Python 的状态 (State)
 struct AdhocState
 {
-    int nodeId;        // 节点 ID
-    double x;          // 位置 X 坐标
-    double y;          // 位置 Y 坐标
-    double throughput; // 实时吞吐量 (作为强化学习的奖励 Reward)
+    int nodeId;
+    double x;
+    double y;
+    double throughput;       // 向后兼容：仍然提供旧字段
+    double myThroughput;     // 当前节点的吞吐量 (奖励)
+    double totalThroughput;  // 全网总吞吐量 (全局信息)
 };
 
-// 定义 Python 发送给 C++ 的动作 (Action)
 struct AdhocAction
 {
-    double txPower;    // 发射功率 (dBm)
-    double beamAngle;  // 波束角度 (度)
+    double txPower;    
+    double beamAngle;  
 };
 
 #endif

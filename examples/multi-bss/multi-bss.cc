@@ -4,135 +4,194 @@
 #include "ns3/config-store-module.h"
 #include "ns3/wifi-module.h"
 #include "ns3/internet-module.h"
-#include "ns3/aodv-module.h"          // 引入 AODV 路由
+#include "ns3/aodv-module.h"
 #include "ns3/applications-module.h"
-#include "ns3/flow-monitor-module.h"  // 引入流量监控
-#include "ns3/antenna-module.h"       // 引入天线模块
-#include "ns3/spectrum-module.h"      // 引入频谱模块
+#include "ns3/flow-monitor-module.h"
 #include "ns3/ai-module.h"
-#include "interface.h"                // 引用上面的头文件
+#include "interface.h"
+#include <array>
+#include <cmath>
+#include <map>
+#include <unistd.h>
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE("AdhocAiExample");
+NS_LOG_COMPONENT_DEFINE("MarlExample");
 
-// 定义共享内存对象指针
 Ns3AiMsgInterfaceImpl<AdhocState, AdhocAction>* m_nodeEnv = nullptr;
-
 Ptr<FlowMonitor> monitor;
 FlowMonitorHelper flowmon;
-
-// 用于记录上一次统计的接收字节数，以便计算瞬时吞吐量
-// Key: 接收端 Node ID, Value: 总接收字节数
 std::map<uint32_t, uint64_t> lastRxBytes;
 
-// 核心交互函数：每 0.1 秒被调度执行一次
+// 全局角度表 (所有节点都在这里)
+std::map<uint32_t, double> g_nodeBeamAngles;
+
+double CalculateAngle(Vector p1, Vector p2)
+{
+    return atan2(p2.y - p1.y, p2.x - p1.x) * 180.0 / M_PI;
+}
+
+// --- 双端定向损耗模型 ---
+class DualDirectionalLossModel : public PropagationLossModel
+{
+public:
+    static TypeId GetTypeId (void)
+    {
+        static TypeId tid = TypeId ("DualDirectionalLossModel")
+            .SetParent<PropagationLossModel> ()
+            .SetGroupName ("Propagation")
+            .AddConstructor<DualDirectionalLossModel> ();
+        return tid;
+    }
+
+    DualDirectionalLossModel() {}
+
+    // 计算单侧增益的辅助函数
+    double GetGain(double myAngle, double targetAngle) const
+    {
+        double beamwidth = 30.0; // 稍宽一点，降低双端对准的极高难度
+        double maxGain = 10.0;   // 单侧增益
+        double sideGain = -20.0; // 单侧衰减
+
+        double diff = std::abs(myAngle - targetAngle);
+        while (diff > 180.0) diff = 360.0 - diff;
+
+        if (diff <= beamwidth / 2.0) {
+            double rad = (diff / (beamwidth / 2.0)) * (M_PI / 2.0);
+            return maxGain * std::cos(rad);
+        }
+        return sideGain;
+    }
+
+    double DoCalcRxPower (double txPowerDbm, Ptr<MobilityModel> a, Ptr<MobilityModel> b) const override
+    {
+        Ptr<Node> txNode = a->GetObject<Node>();
+        Ptr<Node> rxNode = b->GetObject<Node>();
+        uint32_t txId = txNode->GetId();
+        uint32_t rxId = rxNode->GetId();
+
+        // 1. 获取 Tx 角度
+        double txBeam = 0.0;
+        if (g_nodeBeamAngles.count(txId)) txBeam = g_nodeBeamAngles.at(txId);
+
+        // 2. 获取 Rx 角度
+        double rxBeam = 0.0;
+        if (g_nodeBeamAngles.count(rxId)) rxBeam = g_nodeBeamAngles.at(rxId);
+
+        // 3. 计算几何角度
+        Vector pTx = a->GetPosition();
+        Vector pRx = b->GetPosition();
+        
+        // Tx 指向 Rx 的物理角度
+        double angleTxToRx = CalculateAngle(pTx, pRx);
+        // Rx 指向 Tx 的物理角度 (反向)
+        double angleRxToTx = CalculateAngle(pRx, pTx);
+
+        // 4. 计算双端增益
+        double txGain = GetGain(txBeam, angleTxToRx);
+        double rxGain = GetGain(rxBeam, angleRxToTx);
+
+        // 总功率 = 发射功率 + 发射增益 + 接收增益
+        return txPowerDbm + txGain + rxGain;
+    }
+
+    int64_t DoAssignStreams (int64_t stream) override { return 0; }
+};
+
 void UpdateAiLogic(NodeContainer nodes)
 {
-    // 如果接口未初始化或 Python 端断开连接，则停止模拟
-    if (!m_nodeEnv || m_nodeEnv->PyGetFinished())
-    {
+    if (!m_nodeEnv || m_nodeEnv->PyGetFinished()) {
         Simulator::Stop();
         return;
     }
 
-    // --- 步骤 A: 计算实时吞吐量 (作为 Reward) ---
     monitor->CheckForLostPackets();
-    Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
     std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
+    Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
 
-    // 遍历所有节点进行交互
+    std::map<uint32_t, double> linkThroughputs;
+    double totalNetworkThroughput = 0.0;
+    std::array<uint32_t, 2> linkReceivers = {1, 3};
+
+    auto computeThroughput = [&](uint32_t linkReceiverId) {
+        uint64_t currentLinkRx = 0;
+        std::stringstream ssRx; ssRx << "10.1.1." << (linkReceiverId + 1);
+        Ipv4Address rxIp(ssRx.str().c_str());
+
+        for (auto const& [flowId, flowStats] : stats) {
+            Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
+            if (t.destinationAddress == rxIp) {
+                currentLinkRx += flowStats.rxBytes;
+            }
+        }
+
+        double throughput = 0.0;
+        if (currentLinkRx >= lastRxBytes[linkReceiverId]) {
+            uint64_t diff = currentLinkRx - lastRxBytes[linkReceiverId];
+            throughput = (diff * 8.0) / 0.1 / 1024.0 / 1024.0;
+        }
+
+        lastRxBytes[linkReceiverId] = currentLinkRx;
+        linkThroughputs[linkReceiverId] = throughput;
+        totalNetworkThroughput += throughput;
+    };
+
+    for (auto receiverId : linkReceivers) {
+        computeThroughput(receiverId);
+    }
+
     for (uint32_t i = 0; i < nodes.GetN(); ++i)
     {
-        Ptr<Node> node = nodes.Get(i);
-        Ptr<MobilityModel> mob = node->GetObject<MobilityModel>();
-        Vector pos = mob->GetPosition();
+        Ptr<Node> me = nodes.Get(i);
+        uint32_t myId = me->GetId();
+        
+        Vector pos = me->GetObject<MobilityModel>()->GetPosition();
 
-        // 获取共享内存写入指针
+        // 1. 发送状态
         m_nodeEnv->CppSendBegin();
         auto state = m_nodeEnv->GetCpp2PyStruct();
-        state->nodeId = node->GetId();
+        state->nodeId = myId;
         state->x = pos.x;
         state->y = pos.y;
         
-        // 计算 Reward: 这里我们统计发往 Node 9 (Sink) 的业务流吞吐量
-        double currentThroughput = 0.0;
-        uint64_t currentTotalRx = 0;
-
-        // 1. 先统计当前时刻所有发往 Node 9 的总接收字节数
-        for (std::map<FlowId, FlowMonitor::FlowStats>::const_iterator j = stats.begin(); j != stats.end(); ++j)
-        {
-            Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(j->first);
-            if (t.destinationAddress == Ipv4Address("10.1.1.10")) 
-            {
-                currentTotalRx += j->second.rxBytes;
-            }
+        uint32_t linkReceiverId = (myId < 2) ? 1 : 3;
+        double myThroughput = 0.0;
+        auto it = linkThroughputs.find(linkReceiverId);
+        if (it != linkThroughputs.end()) {
+            myThroughput = it->second;
         }
 
-        // 2. 计算增量 (防止下溢)
-        if (currentTotalRx >= lastRxBytes[9])
-        {
-            uint64_t diff = currentTotalRx - lastRxBytes[9];
-            // 吞吐量公式: (Bits) / Time(0.1s) / 1Mbps
-            currentThroughput = (diff * 8.0) / 0.1 / 1024.0 / 1024.0;
-        }
-        else
-        {
-            // 理论上不应该发生，除非 FlowMonitor 被重置
-            currentThroughput = 0;
-        }
+        state->throughput = myThroughput;
+        state->myThroughput = myThroughput;
+        state->totalThroughput = totalNetworkThroughput;
 
-        // 3. 更新历史记录 (注意：这里是更新 Node 9 的总接收量，而不是单个流的)
-        lastRxBytes[9] = currentTotalRx;
-
-        state->throughput = currentThroughput; // 写入 Reward
-
-        // --- 步骤 B: 提交状态并等待动作 ---
-        m_nodeEnv->CppSendEnd(); // 告诉 Python: 数据写好了
-        m_nodeEnv->CppRecvBegin(); // 等待 Python: 动作算好了吗？
-
-        // --- 步骤 C: 读取 Python 返回的动作 ---
-        auto action = m_nodeEnv->GetPy2CppStruct();
-        // double newPower = action->txPower; // Unused
-        double newAngle = action->beamAngle;
+        m_nodeEnv->CppSendEnd();
         
-        m_nodeEnv->CppRecvEnd(); // 结束读取
+        // 2. 接收动作
+        m_nodeEnv->CppRecvBegin();
+        auto action = m_nodeEnv->GetPy2CppStruct();
+        double newAngle = action->beamAngle;
+        m_nodeEnv->CppRecvEnd();
 
-        // --- 步骤 D: 执行动作 (修改 Wifi 发射功率 和 天线角度) ---
-        Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(node->GetDevice(0));
-        if (dev)
-        {
-            Ptr<WifiPhy> phy = dev->GetPhy();
-            Ptr<SpectrumWifiPhy> spectrumPhy = DynamicCast<SpectrumWifiPhy>(phy);
+        // 3. 更新波束
+        g_nodeBeamAngles[myId] = newAngle;
 
-            // 1. 动态调整功率
-            // phy->SetTxPowerStart(newPower);
-            // phy->SetTxPowerEnd(newPower);
-
-            // 2. 动态调整天线角度
-            // 仅在非发送/接收状态下调整，避免干扰 PHY 状态机
-            if (spectrumPhy && !phy->IsStateTx() && !phy->IsStateRx())
-            {
-                Ptr<AntennaModel> antennaModel = spectrumPhy->GetAntenna();
-                Ptr<CosineAntennaModel> cosineAntenna = DynamicCast<CosineAntennaModel>(antennaModel);
-                
-                if (cosineAntenna)
-                {
-                    // CosineAntennaModel 的 Orientation 属性是方位角 (Azimuth)
-                    cosineAntenna->SetAttribute("Orientation", DoubleValue(newAngle));
-                }
-            }
+        // [修改] 注释掉这里的日志，改为在 Python 端统一输出
+        /*
+        if (Simulator::Now().GetMilliSeconds() % 1000 == 0) {
+            std::cout << "Agent " << myId << " Angle: " << newAngle 
+                      << " Tput: " << myThroughput << std::endl;
         }
+        */
     }
 
-    // 循环调度：0.1 秒后再次执行
     Simulator::Schedule(Seconds(0.1), &UpdateAiLogic, nodes);
 }
 
 int main(int argc, char *argv[])
 {
-    uint32_t nNodes = 10;
-    double simTime = 500.0; // 延长模拟时间到 500 秒，给 RL 更多学习时间
+    uint32_t nNodes = 4; 
+    double simTime = 1005.0; 
 
     CommandLine cmd;
     cmd.Parse(argc, argv);
@@ -140,62 +199,40 @@ int main(int argc, char *argv[])
     NodeContainer nodes;
     nodes.Create(nNodes);
 
-    // 1. Wifi 配置 (Ad Hoc 模式 + 定向天线 + SpectrumWifiPhy)
     WifiHelper wifi;
-    wifi.SetStandard(WIFI_STANDARD_80211g);
+    wifi.SetStandard(WIFI_STANDARD_80211n);
 
-    // 使用 SpectrumWifiPhy 以支持天线模型
-    SpectrumWifiPhyHelper wifiPhy;
-    Ptr<MultiModelSpectrumChannel> spectrumChannel = CreateObject<MultiModelSpectrumChannel>();
-    spectrumChannel->SetPropagationDelayModel(CreateObject<ConstantSpeedPropagationDelayModel>());
-    Ptr<FriisSpectrumPropagationLossModel> lossModel = CreateObject<FriisSpectrumPropagationLossModel>();
-    spectrumChannel->AddSpectrumPropagationLossModel(lossModel);
-    wifiPhy.SetChannel(spectrumChannel);
+    // 可以根据信号质量自动调整 MCS (0-7)，信号越好，速率越高，体现对准的作用
+    wifi.SetRemoteStationManager("ns3::MinstrelHtWifiManager");
+
+    YansWifiPhyHelper wifiPhy; 
+    YansWifiChannelHelper wifiChannel = YansWifiChannelHelper::Default();
     
-    // 设置错误率模型
-    wifiPhy.SetErrorRateModel("ns3::NistErrorRateModel");
+    Ptr<YansWifiChannel> channel = CreateObject<YansWifiChannel> ();
+    channel->SetPropagationDelayModel (CreateObject<ConstantSpeedPropagationDelayModel> ());
+    
+    Ptr<PropagationLossModel> loss = CreateObject<DualDirectionalLossModel>(); 
+    loss->SetNext(CreateObject<FriisPropagationLossModel>()); 
+    channel->SetPropagationLossModel(loss);
+    
+    wifiPhy.SetChannel(channel);
 
     WifiMacHelper wifiMac;
-    // 关键：设置为 AdhocWifiMac
     wifiMac.SetType("ns3::AdhocWifiMac");
 
     NetDeviceContainer devices = wifi.Install(wifiPhy, wifiMac, nodes);
 
-    // 手动为每个节点设置 CosineAntennaModel
-    for (uint32_t i = 0; i < nodes.GetN(); ++i)
-    {
-        Ptr<WifiNetDevice> dev = DynamicCast<WifiNetDevice>(nodes.Get(i)->GetDevice(0));
-        Ptr<WifiPhy> phy = dev->GetPhy();
-        Ptr<SpectrumWifiPhy> spectrumPhy = DynamicCast<SpectrumWifiPhy>(phy);
-
-        // 创建 CosineAntennaModel
-        Ptr<CosineAntennaModel> antenna = CreateObject<CosineAntennaModel>();
-        antenna->SetAttribute("Orientation", DoubleValue(0));
-        // antenna->SetAttribute("Beamwidth", DoubleValue(60)); // 移除不支持的属性
-
-        // 将天线模型安装到 Phy
-        if (spectrumPhy)
-        {
-            spectrumPhy->SetAntenna(antenna);
-        }
-    }
-
-    // 2. 移动模型 (Grid - 固定网格布局)
-    // 3x4 网格，间距 30米
+    // 移动性
     MobilityHelper mobility;
-    mobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                  "MinX", DoubleValue(0.0),
-                                  "MinY", DoubleValue(0.0),
-                                  "DeltaX", DoubleValue(30.0),
-                                  "DeltaY", DoubleValue(30.0),
-                                  "GridWidth", UintegerValue(4),
-                                  "LayoutType", StringValue("RowFirst"));
-    
+    Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
+    positionAlloc->Add(Vector(0.0, 0.0, 0.0));   // 0
+    positionAlloc->Add(Vector(50.0, 50.0, 0.0)); // 1
+    positionAlloc->Add(Vector(50.0, 0.0, 0.0));  // 2
+    positionAlloc->Add(Vector(0.0, 50.0, 0.0));  // 3
+    mobility.SetPositionAllocator(positionAlloc);
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mobility.Install(nodes);
 
-    // 3. 网络层 + 路由 (AODV)
-    // Ad Hoc 网络必须有路由协议才能多跳通信
     AodvHelper aodv;
     InternetStackHelper internet;
     internet.SetRoutingHelper(aodv);
@@ -205,51 +242,36 @@ int main(int argc, char *argv[])
     ipv4.SetBase("10.1.1.0", "255.255.255.0");
     Ipv4InterfaceContainer interfaces = ipv4.Assign(devices);
 
-    // 4. 业务流 (Node 0 发给 Node 9)
     uint16_t port = 9;
-    // 使用 OnOffApplication 产生恒定速率流
-    OnOffHelper onoff("ns3::UdpSocketFactory", Address(InetSocketAddress(interfaces.GetAddress(nNodes-1), port)));
-    onoff.SetAttribute("DataRate", StringValue("500kbps"));
-    onoff.SetAttribute("PacketSize", UintegerValue(1024));
+    
+    OnOffHelper onoff1("ns3::UdpSocketFactory", Address(InetSocketAddress(interfaces.GetAddress(1), port)));
+    onoff1.SetAttribute("DataRate", StringValue("100Mbps"));
+    onoff1.SetAttribute("PacketSize", UintegerValue(1024));
+    onoff1.Install(nodes.Get(0)).Start(Seconds(1.0));
+    PacketSinkHelper sink1("ns3::UdpSocketFactory", Address(InetSocketAddress(Ipv4Address::GetAny(), port)));
+    sink1.Install(nodes.Get(1)).Start(Seconds(0.0));
 
-    ApplicationContainer app = onoff.Install(nodes.Get(0));
-    app.Start(Seconds(1.0));
-    app.Stop(Seconds(simTime));
+    OnOffHelper onoff2("ns3::UdpSocketFactory", Address(InetSocketAddress(interfaces.GetAddress(3), port)));
+    onoff2.SetAttribute("DataRate", StringValue("100Mbps"));
+    onoff2.Install(nodes.Get(2)).Start(Seconds(1.0));
+    PacketSinkHelper sink2("ns3::UdpSocketFactory", Address(InetSocketAddress(Ipv4Address::GetAny(), port)));
+    sink2.Install(nodes.Get(3)).Start(Seconds(0.0));
 
-    // 接收端 Sink
-    PacketSinkHelper sink("ns3::UdpSocketFactory", Address(InetSocketAddress(Ipv4Address::GetAny(), port)));
-    ApplicationContainer apps = sink.Install(nodes.Get(nNodes-1));
-    apps.Start(Seconds(0.0));
-    apps.Stop(Seconds(simTime));
-
-    // 5. 安装 FlowMonitor
     monitor = flowmon.InstallAll();
-    lastRxBytes[9] = 0; // 初始化统计数据
+    lastRxBytes[1] = 0; lastRxBytes[3] = 0;
 
-    // 6. 启动 ns3-ai 交互
-    // 参数说明:
-    // 1. is_memory_creator = false (Python 创建)
-    // 2. use_vector = false (使用 Struct 模式)
-    // 3. handle_finish = true (支持 PyGetFinished)
-    // 4. size = 4096 (默认大小)
-    // 5. segment_name = "ns3ai_multibss" (必须匹配)
-    // 后面的参数使用默认值 (My Cpp to Python Msg 等)，不要传 nullptr
-    m_nodeEnv = new Ns3AiMsgInterfaceImpl<AdhocState, AdhocAction>(false, false, true, 4096, "ns3ai_multibss");
+    std::cout << "Waiting 2s for Python..." << std::endl;
+    sleep(2); 
+
+    try {
+        m_nodeEnv = new Ns3AiMsgInterfaceImpl<AdhocState, AdhocAction>(false, false, true, 4096, "ns3ai_multibss");
+    } catch (...) { return 1; }
+    
     Simulator::Schedule(Seconds(0.1), &UpdateAiLogic, nodes);
-
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
     
-    // 显式释放接口对象，触发析构函数发送 "Finished" 信号给 Python
-    // 否则 Python 会一直阻塞在 PyRecvBegin()
-    if (m_nodeEnv)
-    {
-        m_nodeEnv->CppSetFinished();
-        delete m_nodeEnv;
-        m_nodeEnv = nullptr;
-    }
-
+    if (m_nodeEnv) { m_nodeEnv->CppSetFinished(); delete m_nodeEnv; }
     Simulator::Destroy();
-
     return 0;
 }
